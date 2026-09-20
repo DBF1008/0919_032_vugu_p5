@@ -2,6 +2,7 @@ package devutil
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -42,11 +43,11 @@ func NewTinygoCompiler() (*TinygoCompiler, error) {
 // might change once Tinygo has module support, but for now the idea is it
 // makes it reasonably convenient to integration Tinygo into the workflow for Vugu app.
 type TinygoCompiler struct {
-	beforeFunc         func() error
-	generateCmdFunc    func() *exec.Cmd
-	buildCmdFunc       func(outpath string) *exec.Cmd
-	dockerBuildCmdFunc func(outpath string) *exec.Cmd
-	afterFunc          func(outpath string, err error) error
+	beforeFunc         func(ctx context.Context) error
+	generateCmdFunc    func(ctx context.Context) *exec.Cmd
+	buildCmdFunc       func(ctx context.Context, outpath string) *exec.Cmd
+	dockerBuildCmdFunc func(ctx context.Context, outpath string) *exec.Cmd
+	afterFunc          func(ctx context.Context, outpath string, err error) error
 	logWriter          io.Writer
 	//nolint:golint,unused
 	dlTmpGopath        string   // temporary directory that we download dependencies into with go get
@@ -86,11 +87,11 @@ func (c *TinygoCompiler) SetDir(dir string) *TinygoCompiler {
 // SetBuildDir sets the directory of the main package, where `go build` will be run.
 // Relative paths are okay and will be resolved with filepath.Abs.
 func (c *TinygoCompiler) SetBuildDir(dir string) *TinygoCompiler {
-	return c.SetBuildCmdFunc(func(outpath string) *exec.Cmd {
-		cmd := exec.Command("tinygo", "build", "-target=wasm", "-o", outpath, ".")
+	return c.SetBuildCmdFunc(func(ctx context.Context, outpath string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "tinygo", "build", "-target=wasm", "-o", outpath, ".")
 		cmd.Dir = dir
 		return cmd
-	}).SetDockerBuildCmdFunc(func(outpath string) *exec.Cmd {
+	}).SetDockerBuildCmdFunc(func(ctx context.Context, outpath string) *exec.Cmd {
 		buildDir := dir
 		buildDirAbs, err := filepath.Abs(buildDir)
 		if err != nil {
@@ -138,20 +139,22 @@ func (c *TinygoCompiler) SetBuildDir(dir string) *TinygoCompiler {
 		args = append(args, c.tinygoArgs...)
 		args = append(args, ".")
 
-		return exec.Command("docker", args...)
+		return exec.CommandContext(ctx, "docker", args...)
 	})
 }
 
 // SetBuildCmdFunc provides a function to create the exec.Cmd used when running `go build`.
+// The provided context is cancelled when Execute is cancelled or times out.
 // It overrides any other build-related setting.
-func (c *TinygoCompiler) SetBuildCmdFunc(cmdf func(outpath string) *exec.Cmd) *TinygoCompiler {
+func (c *TinygoCompiler) SetBuildCmdFunc(cmdf func(ctx context.Context, outpath string) *exec.Cmd) *TinygoCompiler {
 	c.buildCmdFunc = cmdf
 	return c
 }
 
 // SetDockerBuildCmdFunc provides a function to create the exec.Cmd used when running
 // `tinygo build` in docker.
-func (c *TinygoCompiler) SetDockerBuildCmdFunc(cmdf func(outpath string) *exec.Cmd) *TinygoCompiler {
+// The provided context is cancelled when Execute is cancelled or times out.
+func (c *TinygoCompiler) SetDockerBuildCmdFunc(cmdf func(ctx context.Context, outpath string) *exec.Cmd) *TinygoCompiler {
 	c.dockerBuildCmdFunc = cmdf
 	return c
 }
@@ -159,28 +162,32 @@ func (c *TinygoCompiler) SetDockerBuildCmdFunc(cmdf func(outpath string) *exec.C
 // SetGenerateDir sets the directory of where `go generate` will be run.
 // Relative paths are okay and will be resolved with filepath.Abs.
 func (c *TinygoCompiler) SetGenerateDir(dir string) *TinygoCompiler {
-	return c.SetGenerateCmdFunc(func() *exec.Cmd {
-		cmd := exec.Command("go", "generate")
+	return c.SetGenerateCmdFunc(func(ctx context.Context) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, "go", "generate")
 		cmd.Dir = dir
 		return cmd
 	})
 }
 
 // SetGenerateCmdFunc provides a function to create the exec.Cmd used when running `go generate`.
+// The provided context is cancelled when Execute is cancelled or times out.
 // It overrides any other generate-related setting.
-func (c *TinygoCompiler) SetGenerateCmdFunc(cmdf func() *exec.Cmd) *TinygoCompiler {
+func (c *TinygoCompiler) SetGenerateCmdFunc(cmdf func(ctx context.Context) *exec.Cmd) *TinygoCompiler {
 	c.generateCmdFunc = cmdf
 	return c
 }
 
 // SetBeforeFunc specifies a function to be executed before anything else during Execute().
-func (c *TinygoCompiler) SetBeforeFunc(f func() error) *TinygoCompiler {
+// The function receives the Execute context and must return promptly once it is cancelled.
+func (c *TinygoCompiler) SetBeforeFunc(f func(ctx context.Context) error) *TinygoCompiler {
 	c.beforeFunc = f
 	return c
 }
 
-// SetAfterFunc specifies a function to be executed after everthing else during Execute().
-func (c *TinygoCompiler) SetAfterFunc(f func(outpath string, err error) error) *TinygoCompiler {
+// SetAfterFunc specifies a function to be executed after the build completes during Execute().
+// It is called even when the build fails, in which case err describes that failure.
+// A non-nil error returned by the function is propagated to the caller.
+func (c *TinygoCompiler) SetAfterFunc(f func(ctx context.Context, outpath string, err error) error) *TinygoCompiler {
 	c.afterFunc = f
 	return c
 }
@@ -212,14 +219,30 @@ func (c *TinygoCompiler) SetTinygoDockerImage(img string) *TinygoCompiler {
 	return c
 }
 
-// Execute runs the generate command (if any) and then invokes the Tinygo compiler
-// and produces a wasm executable (or an error).
+// Execute is a convenience wrapper around ExecuteContext using context.Background.
+func (c *TinygoCompiler) Execute() (outpath string, err error) {
+	return c.ExecuteContext(context.Background())
+}
+
+// ExecuteContext runs the generate command (if any) and then invokes the Tinygo
+// compiler and produces a wasm executable (or an error).
+//
+// Cancelling ctx or letting its deadline expire interrupts the running
+// generate/build processes (including the docker container when applicable)
+// and cleans up any temporary output file.
+//
 // The value of outpath is the absolute path to the output file on disk.
 // It will be created with a temporary name and if no error is returned
 // it is the caller's responsibility to delete the file when it is no longer needed.
+// On any error the temporary file is removed by ExecuteContext, so callers must
+// not try to open or remove outpath when err is non-nil.
+//
 // If an error occurs during any of the steps it will be returned with (possibly multi-line)
-// descriptive output in it's error message, as produced by the underlying tool.
-func (c *TinygoCompiler) Execute() (outpath string, err error) {
+// descriptive output in its error message, as produced by the underlying tool.
+func (c *TinygoCompiler) ExecuteContext(ctx context.Context) (outpath string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	logerr := func(e error) error {
 		if e == nil {
@@ -230,57 +253,80 @@ func (c *TinygoCompiler) Execute() (outpath string, err error) {
 	}
 
 	if c.buildCmdFunc == nil {
-		return "", logerr(errors.New("TinygoCompiler: no build directory set, cannot continue (did you forget to call SetBulidDir?)"))
+		return "", logerr(errors.New("TinygoCompiler: no build directory set, cannot continue (did you forget to call SetBuildDir?)"))
+	}
+
+	if err := ctx.Err(); err != nil {
+		return "", logerr(fmt.Errorf("TinygoCompiler: cancelled before build: %w", err))
 	}
 
 	if c.beforeFunc != nil {
-		err := c.beforeFunc()
-		if err != nil {
-			return "", logerr(err)
+		if e := c.beforeFunc(ctx); e != nil {
+			return "", logerr(fmt.Errorf("TinygoCompiler: before func error: %w", e))
 		}
 	}
 
+	runner := cmdRunner{logWriter: c.logWriter}
+
 	if c.generateCmdFunc != nil {
-		cmd := c.generateCmdFunc()
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: generate error: %w; full output:\n%s", err, b))
+		if e := runner.runCmd(ctx, "TinygoCompiler: generate", c.generateCmdFunc(ctx)); e != nil {
+			return "", logerr(e)
 		}
 		fmt.Fprintln(c.logWriter, "TinygoCompiler: Successful generate")
 	}
 
-	tmpf, err := os.CreateTemp("", "WasmCompiler")
-	if err != nil {
-		return "", logerr(fmt.Errorf("WasmCompiler: error creating temporary file: %w", err))
+	tmpf, e := os.CreateTemp("", "WasmCompiler")
+	if e != nil {
+		return "", logerr(fmt.Errorf("WasmCompiler: error creating temporary file: %w", e))
+	}
+	tmpPath := tmpf.Name()
+	if e := tmpf.Close(); e != nil {
+		os.Remove(tmpPath)
+		return "", logerr(fmt.Errorf("WasmCompiler: error closing temporary file: %w", e))
 	}
 
-	outpath = tmpf.Name()
+	// Tinygo writes the output itself, so remove the empty placeholder.
+	os.Remove(tmpPath)
 
-	err = tmpf.Close()
-	if err != nil {
-		return outpath, logerr(fmt.Errorf("WasmCompiler: error closing temporary file: %w", err))
-	}
+	// Remove the temporary output on every failure. tmpPath is captured in
+	// the closure on purpose: on error the named outpath return is reset to
+	// "" before deferred calls run. A successful build keeps the file for
+	// the caller to consume and eventually delete.
+	buildSucceeded := false
+	defer func() {
+		if !buildSucceeded {
+			os.Remove(tmpPath)
+		}
+	}()
 
-	os.Remove(outpath)
-
+	var buildErr error
 	if c.tinygoDockerImage == "" {
-		cmd := c.buildCmdFunc(outpath)
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: build error: %w; cmd.args: %v, full output:\n%s", err, cmd.Args, b))
+		cmd := c.buildCmdFunc(ctx, tmpPath)
+		if e := runner.runCmd(ctx, "TinygoCompiler: build", cmd); e != nil {
+			buildErr = fmt.Errorf("%w; cmd.args: %v", e, cmd.Args)
 		}
-		fmt.Fprintf(c.logWriter, "TinygoCompiler: successful build\n")
-
 	} else {
-		cmd := c.dockerBuildCmdFunc(outpath)
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: build error: %w; cmd.args: %v, full output:\n%s", err, cmd.Args, b))
+		cmd := c.dockerBuildCmdFunc(ctx, tmpPath)
+		if e := runner.runCmd(ctx, "TinygoCompiler: docker build", cmd); e != nil {
+			buildErr = fmt.Errorf("%w; cmd.args: %v", e, cmd.Args)
 		}
-		fmt.Fprintf(c.logWriter, "TinygoCompiler: successful build. Output: %s\n", b)
+	}
+	if buildErr == nil {
+		fmt.Fprintln(c.logWriter, "TinygoCompiler: successful build")
 	}
 
-	return outpath, nil
+	if c.afterFunc != nil {
+		if e := c.afterFunc(ctx, tmpPath, buildErr); e != nil {
+			buildErr = errors.Join(buildErr, fmt.Errorf("TinygoCompiler: after func error: %w", e))
+		}
+	}
+
+	if buildErr != nil {
+		return "", logerr(buildErr)
+	}
+
+	buildSucceeded = true
+	return tmpPath, nil
 }
 
 // WasmExecJS returns the contents of the wasm_exec.js file bundled with Tinygo.

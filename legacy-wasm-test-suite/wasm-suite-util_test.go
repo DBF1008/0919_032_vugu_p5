@@ -515,7 +515,7 @@ func mustTGGenBuildAndLoad(absdir string, useDocker bool) string {
 		wc = wc.NoDocker()
 	}
 
-	outfile, err := wc.Execute()
+	outfile, err := wc.ExecuteContext(context.Background())
 	if err != nil {
 		panic(err)
 	}
