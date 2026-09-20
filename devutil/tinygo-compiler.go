@@ -2,7 +2,7 @@ package devutil
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -214,73 +214,40 @@ func (c *TinygoCompiler) SetTinygoDockerImage(img string) *TinygoCompiler {
 
 // Execute runs the generate command (if any) and then invokes the Tinygo compiler
 // and produces a wasm executable (or an error).
+// It is a shortcut for ExecuteContext with context.Background(); prefer
+// ExecuteContext when a timeout or cancellation signal is available.
+func (c *TinygoCompiler) Execute() (outpath string, err error) {
+	return c.ExecuteContext(context.Background())
+}
+
+// ExecuteContext is like Execute but honors ctx: when ctx is canceled or
+// times out the running generate/build process (and its children) is killed
+// and ctx's error is returned.
 // The value of outpath is the absolute path to the output file on disk.
 // It will be created with a temporary name and if no error is returned
-// it is the caller's responsibility to delete the file when it is no longer needed.
-// If an error occurs during any of the steps it will be returned with (possibly multi-line)
-// descriptive output in it's error message, as produced by the underlying tool.
-func (c *TinygoCompiler) Execute() (outpath string, err error) {
-
-	logerr := func(e error) error {
-		if e == nil {
-			return nil
-		}
-		fmt.Fprintln(c.logWriter, e)
-		return e
+// it is the caller's responsibility to delete the file when it is no longer
+// needed. On any error the temporary file is removed automatically.
+// Generate/build output is streamed to the configured log writer in real
+// time and, on failure, also included in the returned error.
+func (c *TinygoCompiler) ExecuteContext(ctx context.Context) (outpath string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	if c.buildCmdFunc == nil {
-		return "", logerr(errors.New("TinygoCompiler: no build directory set, cannot continue (did you forget to call SetBulidDir?)"))
+	buildCmdFunc := c.buildCmdFunc
+	if c.tinygoDockerImage != "" {
+		buildCmdFunc = c.dockerBuildCmdFunc
 	}
 
-	if c.beforeFunc != nil {
-		err := c.beforeFunc()
-		if err != nil {
-			return "", logerr(err)
-		}
-	}
-
-	if c.generateCmdFunc != nil {
-		cmd := c.generateCmdFunc()
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: generate error: %w; full output:\n%s", err, b))
-		}
-		fmt.Fprintln(c.logWriter, "TinygoCompiler: Successful generate")
-	}
-
-	tmpf, err := os.CreateTemp("", "WasmCompiler")
-	if err != nil {
-		return "", logerr(fmt.Errorf("WasmCompiler: error creating temporary file: %w", err))
-	}
-
-	outpath = tmpf.Name()
-
-	err = tmpf.Close()
-	if err != nil {
-		return outpath, logerr(fmt.Errorf("WasmCompiler: error closing temporary file: %w", err))
-	}
-
-	os.Remove(outpath)
-
-	if c.tinygoDockerImage == "" {
-		cmd := c.buildCmdFunc(outpath)
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: build error: %w; cmd.args: %v, full output:\n%s", err, cmd.Args, b))
-		}
-		fmt.Fprintf(c.logWriter, "TinygoCompiler: successful build\n")
-
-	} else {
-		cmd := c.dockerBuildCmdFunc(outpath)
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("TinygoCompiler: build error: %w; cmd.args: %v, full output:\n%s", err, cmd.Args, b))
-		}
-		fmt.Fprintf(c.logWriter, "TinygoCompiler: successful build. Output: %s\n", b)
-	}
-
-	return outpath, nil
+	return executeContext(ctx, compilerRunConfig{
+		name:              "TinygoCompiler",
+		beforeFunc:        c.beforeFunc,
+		generateCmdFunc:   c.generateCmdFunc,
+		buildCmdFunc:      buildCmdFunc,
+		afterFunc:         c.afterFunc,
+		logWriter:         c.logWriter,
+		removeBeforeBuild: true,
+	})
 }
 
 // WasmExecJS returns the contents of the wasm_exec.js file bundled with Tinygo.

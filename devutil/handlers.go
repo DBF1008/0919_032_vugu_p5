@@ -2,6 +2,7 @@ package devutil
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -12,7 +13,7 @@ import (
 
 // Compiler is implemented by WasmCompiler and TinygoCompiler.
 type Compiler interface {
-	Execute() (outpath string, err error)
+	ExecuteContext(ctx context.Context) (outpath string, err error)
 }
 
 // WasmExecJSer is implemented by WasmCompiler and TinygoCompiler.
@@ -35,7 +36,10 @@ func NewMainWasmHandler(wc Compiler) *MainWasmHandler {
 // ServeHTTP implements http.Handler.
 func (h *MainWasmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	outpath, err := h.wc.Execute()
+	// Tie the build to the request lifecycle: if the client disconnects or
+	// the request is canceled, the build subprocess is interrupted instead
+	// of keeping running in the background.
+	outpath, err := h.wc.ExecuteContext(r.Context())
 	if err != nil {
 		log.Printf("MainWasmHandler: Execute error:\n%v", err)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

@@ -2,8 +2,7 @@ package devutil
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -94,66 +93,33 @@ func (c *WasmCompiler) SetAfterFunc(f func(outpath string, err error) error) *Wa
 
 // Execute runs the generate command (if any) and then invokes the Go compiler
 // and produces a wasm executable (or an error).
+// It is a shortcut for ExecuteContext with context.Background(); prefer
+// ExecuteContext when a timeout or cancellation signal is available.
+func (c *WasmCompiler) Execute() (outpath string, err error) {
+	return c.ExecuteContext(context.Background())
+}
+
+// ExecuteContext is like Execute but honors ctx: when ctx is canceled or
+// times out the running generate/build process (and its children) is killed
+// and ctx's error is returned.
 // The value of outpath is the absolute path to the output file on disk.
 // It will be created with a temporary name and if no error is returned
-// it is the caller's responsibility to delete the file when it is no longer needed.
-// If an error occurs during any of the steps it will be returned with (possibly multi-line)
-// descriptive output in it's error message, as produced by the underlying tool.
-func (c *WasmCompiler) Execute() (outpath string, err error) {
-
-	logerr := func(e error) error {
-		if e == nil {
-			return nil
-		}
-		fmt.Fprintln(c.logWriter, e)
-		return e
+// it is the caller's responsibility to delete the file when it is no longer
+// needed. On any error the temporary file is removed automatically.
+// Generate/build output is streamed to the configured log writer in real
+// time and, on failure, also included in the returned error.
+func (c *WasmCompiler) ExecuteContext(ctx context.Context) (outpath string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-
-	if c.buildCmdFunc == nil {
-		return "", logerr(errors.New("WasmCompiler: no build command set, cannot continue (did you forget to call SetBulidDir?)"))
-	}
-
-	if c.beforeFunc != nil {
-		err := c.beforeFunc()
-		if err != nil {
-			return "", logerr(err)
-		}
-	}
-
-	if c.generateCmdFunc != nil {
-		cmd := c.generateCmdFunc()
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			return "", logerr(fmt.Errorf("WasmCompiler: generate error: %w; full output:\n%s", err, b))
-		}
-		fmt.Fprintln(c.logWriter, "WasmCompiler: Successful generate")
-	}
-
-	tmpf, err := os.CreateTemp("", "WasmCompiler")
-	if err != nil {
-		return "", logerr(fmt.Errorf("WasmCompiler: error creating temporary file: %w", err))
-	}
-
-	outpath = tmpf.Name()
-
-	err = tmpf.Close()
-	if err != nil {
-		return outpath, logerr(fmt.Errorf("WasmCompiler: error closing temporary file: %w", err))
-	}
-
-	cmd := c.buildCmdFunc(outpath)
-	b, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", logerr(fmt.Errorf("WasmCompiler: build error: %w; full output:\n%s", err, b))
-	}
-	fmt.Fprintln(c.logWriter, "WasmCompiler: Successful build")
-
-	if c.afterFunc != nil {
-		err = c.afterFunc(outpath, err)
-	}
-
-	return outpath, logerr(err)
-
+	return executeContext(ctx, compilerRunConfig{
+		name:            "WasmCompiler",
+		beforeFunc:      c.beforeFunc,
+		generateCmdFunc: c.generateCmdFunc,
+		buildCmdFunc:    c.buildCmdFunc,
+		afterFunc:       c.afterFunc,
+		logWriter:       c.logWriter,
+	})
 }
 
 // WasmExecJS returns the contents of the wasm_exec.js file bundled with the Go compiler.
